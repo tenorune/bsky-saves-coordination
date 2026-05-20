@@ -1,6 +1,6 @@
 # Installer status panel — cross-repo coordination doc
 
-> **Status:** drafting (2026-05-18). GUI revision: session-mode TTL + clear-path correction + `current_state` field + heartbeat/debounce requirements. Awaiting CLI + installer review.
+> **Status:** drafting (2026-05-18). GUI revision: session-mode TTL + clear-path correction + `current_state` field + heartbeat/debounce requirements. CLI revision: answers to Q5–Q7, restored §4.7 security model, raised Q9. Awaiting installer review.
 > **Lives at:** `bsky-saves-coordination:docs/installer-status-panel.md` (canonical). Mirrored as a draft in each primary repo's `coordination` branch and PRed back via cross-repo workflow.
 > **Audience:** maintainers of `bsky-saves` (helper / CLI), `bsky-saves-gui` (Svelte PWA), and `bsky-saves-install` (native macOS app + future Win/Linux installers).
 > **Scope:** the contract for the installer's status panel — what info it surfaces, where the info comes from, who's responsible for each leg.
@@ -73,7 +73,7 @@ The helper is a state-cache proxy: it holds the latest status the GUI reported. 
 - Response: `204 No Content` on accept.
 - Concurrency: last-write-wins (see [R3](./installer-status-panel-resolved.md#r3--multiple-gui-sessions-on-one-helper)). The payload always carries `did` so per-DID indexing is a forward-compatible upgrade.
 - **Mode-dependent storage** (the privacy-critical bit):
-  - When `storage.mode === "persist"` (default), the helper updates its in-memory copy AND atomic-writes the on-disk mirror at `<config_dir>/bsky-saves/status.json`. Snapshot survives helper restart (loaded into memory on startup).
+  - When `storage.mode === "persist"` (default), the helper updates its in-memory copy AND atomic-writes the on-disk mirror at `<config_dir>/bsky-saves/status.json`. Snapshot survives helper restart (loaded into memory on startup). Disk-write frequency is governed by Q7 (under proposal: coalesce ≤1/s).
   - When `storage.mode === "session"`, the helper updates its in-memory copy ONLY — no disk write — and applies a TTL whose value comes from the payload's `storage.session_ttl_seconds`. Each subsequent push from the same DID refreshes the TTL. When the TTL expires with no refresh, the helper drops the in-memory snapshot.
   - The two storage tiers (memory-session, disk-persist) are independent. A session-mode push does NOT overwrite a previously written persist-mode disk snapshot from a different sign-in. Implementer's note: a simple model is `{ memory_snapshot, memory_expires_at, disk_snapshot }`. Reads (`GET /status`) prefer unexpired memory, fall back to disk, return 404 if neither exists.
 
@@ -96,7 +96,7 @@ The mode-dependent split honors the GUI's persist-vs-session privacy contract: a
 
 - Same directory as the token file (`status.json` sibling to `token`).
 - File perms: `0600` (matches the token file's threat model — the status payload carries handle info worth keeping out of other users' reads).
-- Written via the existing `atomic_write_inventory` pattern (temp + `os.replace`).
+- Written via the existing `atomic_write_inventory` pattern (temp + `os.replace`), with concurrency-safe per-write tmp names if Q7 closes on "coalesced single-flighted background flush" rather than per-push writes.
 - Loaded into the helper's in-memory cache on startup; if file missing, in-memory cache starts empty.
 - NOT written in session mode. The file's presence reflects exactly one user history: a persist-mode push happened, the daemon now caches it across restarts.
 
@@ -192,7 +192,7 @@ Fields are optional except where noted; the GUI omits sections it can't cheaply 
 
 ### 4.5 Panel-side surface (`bsky-saves-install` repo)
 
-The panel polls `GET /status` at a low rate while open (≤ once every 5 seconds is plenty given humans don't watch dashboards updating at sub-second granularity), authenticates with the same session token it already holds from pairing, renders the fields.
+The panel polls `GET /status` at a low rate while open (≤ once every 5 seconds is plenty given humans don't watch dashboards updating at sub-second granularity — final cadence determined by Q8), authenticates with the same session token it already holds from pairing, renders the fields.
 
 UI choices live entirely in the installer repo. Suggested defaults: counts as numerals, hydration as bar gauges, `updated_at` rendered as "12 min ago" relative time, `current_state === "refreshing"` as a small spinner.
 
@@ -205,6 +205,44 @@ Staleness handling: if `updated_at` is older than a panel-defined threshold (e.g
 All three endpoints (`POST /status`, `GET /status`, `DELETE /status`) sit behind the existing `_check_token` middleware introduced in v0.6.2. Same `Authorization: Bearer <token>` semantics as `/fetch`, `/auth/check`, etc. Same `WWW-Authenticate` shaping on 401 (per v0.6.5's add) so the GUI's 401-interceptor handles them identically.
 
 The trust boundary is unchanged: anyone who can read `<config_dir>/bsky-saves/token` can call these endpoints; same as today.
+
+### 4.7 Security model — clear-text rationale
+
+The status payload is **clear text at every layer**: in transit on loopback HTTP, in helper process memory, and in the on-disk mirror file (persist mode only). This is intentional. The trust model and the payload's sensitivity bound jointly justify it.
+
+#### Layers and their protections
+
+| Stage | Form | What protects it |
+|---|---|---|
+| GUI → helper | Plain HTTP `POST /status` body | Helper binds `127.0.0.1` only; Bearer auth from `_check_token` |
+| Helper memory | Python dict in process heap | Standard same-user process isolation |
+| Helper → disk (persist mode only) | JSON file at `<config_dir>/bsky-saves/status.json`, `0600` | File-system perms; same trust boundary as the token file |
+| Helper → panel | Plain HTTP `GET /status` body | Same as GUI → helper |
+
+#### Why each layer isn't encrypted
+
+- **Wire is not HTTPS** because the helper binds loopback only. Loopback traffic never leaves the machine, so there's no off-machine MITM exposure. Adding HTTPS would require provisioning a self-signed cert that every consumer (GUI, panel, scripts using `bsky-saves token`) accepts; the threat model doesn't justify it. Other processes on the same machine running as the same user can sniff loopback traffic, but those same processes can also read the token file at `0600` and call the helper with full credentials — so loopback HTTPS doesn't add real defense.
+- **Memory is not encrypted** because any same-user process can attach a debugger to any other same-user process. Encryption at rest in process memory is theater.
+- **Disk is not encrypted** for the same reason the token file isn't: `0600` perms + same-user trust model. Encrypting it would require either OS-keychain integration (per-platform complexity) or a user-managed password, both of which exceed the value being protected.
+
+#### What the payload MUST NOT contain
+
+This is the load-bearing constraint that makes the above acceptable. Each new field is reviewed against this list at PR time:
+
+- Any save's full post text, author identity beyond the user's own handle, URI, or attached media
+- JWTs, app passwords, OAuth tokens, refresh tokens, or the pairing token itself
+- Image bytes, image URLs containing dynamic-key tokens, or local file paths revealing the user's filesystem layout
+- Per-save metadata (titles, dates, links, hashtags, replied-to identities)
+- Search queries, follow graph, mute/block lists, or any social-graph data
+- Anything that, if leaked, would compromise the user's account or their library's contents
+
+The phase-1 payload (§4.4) contains only: the user's own public Bluesky identity (handle + DID — both publicly resolvable), aggregate counts, completion ratios, storage mode, and last-activity summary. Sensitivity floor: roughly "someone who reads this learns Alice has 1,247 saves, last fetched 12 min ago, 78% have article hydration." That's lower-sensitivity than what's already in the user's tier-1 inventory file (which CLI users keep on disk in clear text without comparable scrutiny).
+
+#### Sensitivity check at PR time
+
+Any PR that adds a field to the payload (whether in `bsky-saves-gui`'s push code or in this doc's payload schema) must include a one-sentence note answering: *"What does this field tell a reader, and is it in the MUST NOT list above?"* If unsure, default to omitting and reopen the question with the maintainer of `bsky-saves` before merging.
+
+This check applies symmetrically to phase 2's command payloads when that work lands.
 
 ## 5. Phase 2 — commands from panel to GUI
 
@@ -239,11 +277,37 @@ Numbered for ease of reference. Answers go inline once locked; resolved items mo
 
 **Q5 — Push debouncing rate** *(raised by GUI 2026-05-18)*. GUI proposes max one push per 500ms (see §4.3). CLI team: does this match what the helper's HTTP stack can comfortably handle, or should the floor be tighter (250ms / 1s)? If 500ms is fine, this gets folded into §4.3 as the canonical floor.
 
+> **CLI response (2026-05-18):** 500ms is comfortable for the helper. `ThreadingHTTPServer` handles each request on its own thread; the helper's per-request work for `POST /status` is JSON parse + dict assignment + (in persist mode) a queued disk write — all sub-millisecond. The helper could handle pushes at 10–100/sec without breaking; 500ms is generous. **Concurs with the GUI's proposal**; would not object to tighter (250ms) if the GUI wants snappier panel feedback during hydration bursts. Status: proposed-by-CLI (concurs).
+
 **Q6 — Session-mode heartbeat cadence and TTL** *(raised by GUI 2026-05-18)*. GUI proposes 15s heartbeat / 60s TTL (4× safety margin against a single missed push). CLI team: any preference on the TTL value? Longer TTL = more tolerance for network blips; shorter = quicker cleanup after tab close. Whatever's chosen, the heartbeat should be ≤ TTL/3 to survive a missed push.
+
+> **CLI response (2026-05-18):** 60s TTL / 15s heartbeat is fine. The helper-side implementation is lazy expiry — compare `now()` against `memory_expires_at` on each `GET /status`; no per-second tick, no background timer. Cheap regardless of TTL value. **Concurs with the GUI's proposal**; the panel UX, not the helper, is the constraint that should anchor the number, and 60s drops within "tab probably closed" intuition. Status: proposed-by-CLI (concurs).
 
 **Q7 — Persist-mode disk-write frequency** *(raised by GUI 2026-05-18)*. Per §4.2, the helper atomic-writes to disk on every persist-mode push. For a heavy hydration phase (~2 pushes/second from §4.3 debouncer) that's a lot of disk writes. Is this OK, or does the helper want to coalesce writes (e.g., flush at most once per second, with a final write triggered by a `priority: "final"` hint the GUI can send on `beforeunload`)?
 
+> **CLI response (2026-05-18):** **Coalesce.** Concrete proposal:
+>
+> - In-memory snapshot updates immediately on every `POST /status` (so `GET /status` always sees the latest).
+> - Disk flush happens at most once per second via a debounced background task that observes the in-memory snapshot.
+> - GUI can send `priority: "final"` (a new optional top-level boolean in the payload) to bypass the coalescer and flush immediately — useful for `beforeunload` cases where the GUI knows it's the last push of the session.
+> - Helper shutdown (SIGTERM, Ctrl-C) synchronously flushes the latest in-memory snapshot to disk before exiting.
+>
+> Rationale on the helper side: not a perf concern (an atomic write on macOS SSD is ~1–5ms; 7,200 writes/hour during sustained hydration is trivial), but the existing `atomic_write_inventory` pattern uses a single tmp filename (`path.with_suffix(".tmp")`) which races under concurrent writes from multiple `ThreadingHTTPServer` worker threads. Coalescing through a single background flush task sidesteps the race without needing to fix the broader inventory-writer's tmp-name scheme.
+>
+> Tradeoff: up to ~1s of staleness on crash (the in-memory state ahead of disk by at most one debounce window). Acceptable for status — phase-1 contract doesn't promise crash-recovery freshness beyond the pre-push value.
+>
+> This implies a small body change to §4.2 once locked: the "atomic-writes the on-disk mirror" phrasing becomes "queues a flush to the coalesced background task" with the priority-final exception called out. Holding the body edit until Q7 resolves. Status: proposed-by-CLI.
+
 **Q8 — Installer poll cadence** *(raised by GUI 2026-05-18 for installer team)*. §4.5 suggests ≤ once per 5 seconds. Installer team: what cadence works best with idle-friendly power management on macOS / Windows? Slower polls (e.g., 10s) are friendlier to battery; faster (1–2s) feels more "live" to the user. Or: switch cadence based on whether the panel is currently visible / focused?
+
+> *(No CLI input — installer team's question.)*
+
+**Q9 — Resolved-questions archive companion file missing** *(raised by CLI 2026-05-18)*. §4.2, §4.3, §6, and other sections backlink to `R3`, `R4`, `R5` in `installer-status-panel-resolved.md`, but that file is not present at the coord repo's `main` (raw URL returns 404). The GUI revision's changelog says "resolved appendix seeded with R1–R5" but the companion file wasn't included in the merged version. Two paths forward:
+>
+> - GUI team pushes the seeded `R1–R5` content as a separate revision against the coord repo's `installer-status-panel-resolved.md` path (the workflow YAML supports any `target` path under `docs/`, so the same mechanism works).
+> - Or: the maintainer reconstructs minimal `R1–R5` stubs from the GUI's resolution rationale (Q1–Q4 closed in body + the R5 rationale referenced in §4.2's DELETE block).
+>
+> Either way, phase-1 implementation shouldn't proceed with broken cross-references — readers landing on `R3`/`R4`/`R5` links will hit 404s. Status: proposed-by-CLI (process gap; awaiting GUI team to push the missing file or maintainer to seed).
 
 ## 8. Maintenance
 
@@ -267,6 +331,7 @@ When the design changes substantively (e.g., adopting phase 2's command flow), b
 |---|---|---|
 | 2026-05-17 | CLI | Initial draft (§§1–8 + Appendices A–B). Open questions Q1–Q4 surfaced. |
 | 2026-05-18 | GUI | Session-mode privacy: added mode-dependent storage to §4.2 (memory-only + TTL for session, atomic disk write for persist). Added `current_state` field and `storage.session_ttl_seconds` to §4.4 payload. Clarified `last_activity.errors` shape. Made §4.3 push triggers explicit (required vs. mode-required). Added `DELETE /status` endpoint to §4.2 for explicit "Clear all data" path; clarified that sign-out is NOT a clear. Documented push debouncing floor. Raised Q5–Q8. Resolved Q1–Q4 in body; resolved appendix seeded with R1–R5. |
+| 2026-05-18 | CLI | Answered Q5 (concurs with 500ms floor), Q6 (concurs with 60s/15s), Q7 (proposes coalesced background flush ≤1/s, with `priority: "final"` and shutdown-synchronous exceptions). Restored §4.7 security model (clear-text rationale + MUST-NOT list + sensitivity check at PR time) — drafted on a primary-repo branch that wasn't included in the GUI revision's basis. Noted in §4.2 that `<config_dir>/bsky-saves/status.json` write path may use concurrency-safe per-write tmp names if Q7 resolves on coalesced writes. Raised Q9 re: missing `installer-status-panel-resolved.md` companion file (R3/R4/R5 backlinks 404 against coord repo's main). No body content changed beyond §4.7 restoration; Q7's implied §4.2 body update held until the question resolves. |
 
 ---
 
@@ -275,8 +340,9 @@ When the design changes substantively (e.g., adopting phase 2's command flow), b
 A condensed checklist for whoever drives phase 1 to ground. None of these are open design questions; they're sequencing-and-ownership decisions.
 
 - [ ] Confirm helper-side endpoints (`POST /status`, `GET /status`, `DELETE /status`) and persistence path with the `bsky-saves` maintainer.
-- [ ] GUI team commits to the §4.4 payload shape (or proposes amendments). Section 7 open questions Q5–Q8 resolved.
+- [ ] GUI team commits to the §4.4 payload shape (or proposes amendments). Section 7 open questions Q5–Q9 resolved.
 - [ ] Installer team confirms polling cadence (Q8) and UI rendering pass.
+- [ ] Resolved-questions companion file (`installer-status-panel-resolved.md`) seeded and present at coord repo's `main` (per Q9).
 - [ ] Spec docs open in each primary repo (`docs/superpowers/specs/YYYY-MM-DD-status-snapshot.md` per the project convention); plan docs follow; implementation goes through the existing subagent-driven-development flow.
 - [ ] Coordinated release: helper version that ships the endpoints, GUI version that ships the push call, installer version that ships the panel. All three pinned together in the installer's bundle.
 
