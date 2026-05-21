@@ -1,6 +1,6 @@
 # Installer status panel — cross-repo coordination doc
 
-> **Status:** drafting (2026-05-20). GUI revision: session-mode TTL + clear-path correction + `current_state` field + heartbeat/debounce requirements. CLI revision: answers to Q5–Q7, restored §4.7 security model, raised Q9. GUI revision (this round): resolves Q5/Q6/Q7/Q9 in body; adds optional `priority: "final"` payload field per CLI's Q7 proposal; restores `installer-status-panel-resolved.md` companion (R1–R9). Awaiting installer review of Q8.
+> **Status:** drafting (2026-05-21). Installer revision: Q8 (poll cadence) resolved in §4.5 — visibility-gated polling at 5s while the popover is visible. Staleness-indicator threshold pinned at 5 minutes. No payload, endpoint, or auth changes. §7 has no remaining open questions.
 > **Lives at:** `bsky-saves-coordination:docs/installer-status-panel.md` (canonical). Mirrored as a draft in each primary repo's `coordination` branch and PRed back via cross-repo workflow.
 > **Audience:** maintainers of `bsky-saves` (helper / CLI), `bsky-saves-gui` (Svelte PWA), and `bsky-saves-install` (native macOS app + future Win/Linux installers).
 > **Scope:** the contract for the installer's status panel — what info it surfaces, where the info comes from, who's responsible for each leg.
@@ -23,7 +23,7 @@ This document captures the design that emerged from the v0.6.x release-cycle con
 |---|---|
 | `bsky-saves` | The helper daemon. New `POST /status`, `GET /status`, and `DELETE /status` endpoints in phase 1; the on-disk status-cache file for persist mode with coalesced background flush; an in-memory TTL slot for session mode; auth gating identical to other credentialed endpoints. |
 | `bsky-saves-gui` | Pushing summary library stats to the helper at meaningful moments. Owns the payload contents (§4.4), the push trigger list (§4.3), the session-mode heartbeat (§4.3), the `priority: "final"` hint on terminal pushes (§4.3, §4.4), and how library state is computed. |
-| `bsky-saves-install` | The status panel UI. Polls `GET /status` and renders. Distinguishes "no snapshot yet", "active snapshot", and "stale snapshot" (where `updated_at` is older than a UI-defined threshold). In later phases, issues commands. |
+| `bsky-saves-install` | The status panel UI. Polls `GET /status` while the popover is visible (§4.5) and renders. Distinguishes "no snapshot yet", "active snapshot", and "stale snapshot" (where `updated_at` is older than the §4.5 staleness threshold). In later phases, issues commands. |
 
 Each repo owns its part of the contract. The three repos coordinate via this document.
 
@@ -199,13 +199,15 @@ Fields are optional except where noted; the GUI omits sections it can't cheaply 
 
 ### 4.5 Panel-side surface (`bsky-saves-install` repo)
 
-The panel polls `GET /status` at a low rate while open (≤ once every 5 seconds is plenty given humans don't watch dashboards updating at sub-second granularity — final cadence determined by Q8), authenticates with the same session token it already holds from pairing, renders the fields.
+The panel polls `GET /status` **only while the popover is visible**: one fetch immediately on popover show, then every 5 seconds while the popover remains visible, stopping on dismiss. The 5s cadence matches the panel's existing health-poll timer (the `Supervisor.is_alive()` + `/ping` check that drives the menu-bar state badge), so `/status` is co-fetched on the same tick — no second timer. 5s sits comfortably under [R7](./installer-status-panel-resolved.md#r7--session-mode-heartbeat-cadence-and-ttl)'s 15s heartbeat / 60s TTL window: the panel observes fresh pushes and session-mode-TTL-expiry 404 transitions both within ≤5s of the helper-side change. Polling is gated on visibility because the popover is closed most of the time, and a poll the user can't see is unobserved work that consumes battery on macOS / Windows idle. See [R10](./installer-status-panel-resolved.md#r10--installer-poll-cadence).
+
+The panel authenticates with the same session token it already holds from pairing.
 
 UI choices live entirely in the installer repo. Suggested defaults: counts as numerals, hydration as bar gauges, `updated_at` rendered as "12 min ago" relative time, `current_state === "refreshing"` as a small spinner.
 
 When `GET /status` returns 404 — no snapshot yet, or session-mode snapshot expired — panel displays a placeholder ("No active library status — open the GUI and run a fetch") with a button that opens the bundled GUI URL.
 
-Staleness handling: if `updated_at` is older than a panel-defined threshold (e.g., 5 minutes), the panel renders the values with a subtle "last seen N min ago" indicator. The panel does NOT poll-with-backoff; the helper's TTL is the authoritative liveness signal for session mode, and persist-mode snapshots are expected to persist (the user is OK with the data lingering).
+**Staleness handling:** if `updated_at` is older than **5 minutes**, the panel renders the values with a subtle "last seen N min ago" indicator. 5 min sits well above session mode's 15s heartbeat cadence (an actively-pushing session-mode GUI will never trip this) and above any reasonable GUI-side push delay, while still flagging genuinely-stale persist-mode snapshots from long-idle users. The panel does NOT poll-with-backoff; the helper's TTL is the authoritative liveness signal for session mode, and persist-mode snapshots are expected to persist (the user is OK with the data lingering).
 
 ### 4.6 Authentication and trust
 
@@ -282,7 +284,7 @@ Multi-handle / multi-inventory edge cases (the maintainer setup explicitly hits 
 
 Numbered for ease of reference. Answers go inline once locked; resolved items move to [`installer-status-panel-resolved.md`](./installer-status-panel-resolved.md) with a backlink from the section they inform.
 
-**Q8 — Installer poll cadence** *(raised by GUI 2026-05-18 for installer team)*. §4.5 suggests ≤ once per 5 seconds. Installer team: what cadence works best with idle-friendly power management on macOS / Windows? Slower polls (e.g., 10s) are friendlier to battery; faster (1–2s) feels more "live" to the user. Or: switch cadence based on whether the panel is currently visible / focused?
+*No open questions at this time. All phase-1 questions Q1–Q9 are resolved; rationale lives in the [resolved-questions archive](./installer-status-panel-resolved.md) as R1–R10. Reopen via a new numbered entry here if any decision needs revisiting.*
 
 ## 8. Maintenance
 
@@ -308,6 +310,7 @@ When the design changes substantively (e.g., adopting phase 2's command flow), b
 | 2026-05-18 | GUI | Session-mode privacy: added mode-dependent storage to §4.2 (memory-only + TTL for session, atomic disk write for persist). Added `current_state` field and `storage.session_ttl_seconds` to §4.4 payload. Clarified `last_activity.errors` shape. Made §4.3 push triggers explicit (required vs. mode-required). Added `DELETE /status` endpoint to §4.2 for explicit "Clear all data" path; clarified that sign-out is NOT a clear. Documented push debouncing floor. Raised Q5–Q8. Resolved Q1–Q4 in body; resolved appendix seeded with R1–R5 (companion file NOT in this PR — addressed below). |
 | 2026-05-18 | CLI | Answered Q5 (concurs with 500ms floor), Q6 (concurs with 60s/15s), Q7 (proposes coalesced background flush ≤1/s, with `priority: "final"` and shutdown-synchronous exceptions). Restored §4.7 security model (clear-text rationale + MUST-NOT list + sensitivity check at PR time) — drafted on a primary-repo branch that wasn't included in the GUI revision's basis. Noted in §4.2 that `<config_dir>/bsky-saves/status.json` write path may use concurrency-safe per-write tmp names if Q7 resolves on coalesced writes. Raised Q9 re: missing `installer-status-panel-resolved.md` companion file (R3/R4/R5 backlinks 404 against coord repo's main). No body content changed beyond §4.7 restoration; Q7's implied §4.2 body update held until the question resolves. |
 | 2026-05-20 | GUI | Resolved Q5 in §4.3 (500ms floor locked, with note that GUI may tighten to 250ms later without contract change). Resolved Q6 in §4.3 (15s heartbeat / 60s TTL locked). Resolved Q7 in §4.2 (adopts CLI's coalesced background flush proposal; persist-mode in-memory updates immediately, disk flush ≤ 1/s, `priority: "final"` bypass via `navigator.sendBeacon` on `beforeunload`, shutdown-synchronous flush). Added `priority` optional top-level string field to §4.4 payload (string-enum for forward compat: `"final"` is the only recognized non-default value today). Added "RECOMMENDED in persist mode" trigger to §4.3 covering the beforeunload final push. Resolved Q9 by including `installer-status-panel-resolved.md` in this same PR (workflow now supports multi-file manifests). Moved Q5/Q6/Q7/Q9 to appendix as R6/R7/R8/R9. Q8 (installer poll cadence) remains open. |
+| 2026-05-21 | Installer | Resolved Q8 in §4.5: visibility-gated polling — one fetch on popover show, every 5s while the popover is visible, no polling while closed. Co-fetches `/status` on the same 5s timer that already drives the menu-bar state badge (no second timer, no extra wake-ups). Pinned the staleness-indicator threshold to 5 minutes (was "e.g., 5 minutes" suggestion). No payload, endpoint, auth, or schema changes. Moved Q8 to appendix as R10. §7 now empty (all phase-1 questions resolved). Updated Appendix A to check off the polling-cadence item. |
 
 ---
 
@@ -316,8 +319,8 @@ When the design changes substantively (e.g., adopting phase 2's command flow), b
 A condensed checklist for whoever drives phase 1 to ground. None of these are open design questions; they're sequencing-and-ownership decisions.
 
 - [ ] Confirm helper-side endpoints (`POST /status`, `GET /status`, `DELETE /status`) and persistence path with the `bsky-saves` maintainer.
-- [ ] GUI team commits to the §4.4 payload shape (final shape locks once Q8 resolves and the panel team confirms no extra fields are needed for poll-cadence UX).
-- [ ] Installer team confirms polling cadence (Q8) and UI rendering pass.
+- [ ] GUI team commits to the §4.4 payload shape (final shape locks once §7 is empty and all teams have confirmed their slice — §7 is now empty; awaiting GUI confirmation).
+- [x] Installer team confirms polling cadence (Q8 resolved 2026-05-21 — see [R10](./installer-status-panel-resolved.md#r10--installer-poll-cadence)). UI rendering pass pending implementation in `bsky-saves-install`.
 - [x] Resolved-questions companion file (`installer-status-panel-resolved.md`) seeded and present at coord repo's `main` (closed by GUI 2026-05-20 — see [R9](./installer-status-panel-resolved.md#r9--resolved-questions-archive-companion-file-missing)).
 - [ ] Spec docs open in each primary repo (`docs/superpowers/specs/YYYY-MM-DD-status-snapshot.md` per the project convention); plan docs follow; implementation goes through the existing subagent-driven-development flow.
 - [ ] Coordinated release: helper version that ships the endpoints, GUI version that ships the push call, installer version that ships the panel. All three pinned together in the installer's bundle.

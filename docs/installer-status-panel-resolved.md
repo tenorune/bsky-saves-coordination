@@ -140,3 +140,28 @@ Implementation note for the helper: the per-write tmp-name concurrency hazard CL
 **Resolution:** Root cause was the original coordination workflow being single-file per run; the GUI's first push only carried `installer-status-panel.md`, not its companion. The workflow has since been upgraded (2026-05-20) to a manifest-driven model that PRs an arbitrary file list in a single PR. The GUI's 2026-05-20 revision includes both files in one PR via that mechanism, closing the gap.
 
 Process forward: any future revision that touches both files will include both in the manifest. Workflow drift between the body's `(see R<n>)` backlinks and the appendix's presence is now mechanically prevented — the manifest review during PR is where any mismatch surfaces.
+
+---
+
+## R10 — Installer poll cadence
+
+**Raised by:** GUI (2026-05-18) as §7 Q8.
+**Resolved by:** Installer (2026-05-21) in §4.5.
+
+**Question:** §4.5 suggests ≤ once per 5 seconds. Installer team: what cadence works best with idle-friendly power management on macOS / Windows? Slower polls (e.g., 10s) are friendlier to battery; faster (1–2s) feels more "live" to the user. Or: switch cadence based on whether the panel is currently visible / focused?
+
+**Resolution:** **Visibility-gated polling, 5s cadence.**
+
+- One `GET /status` immediately on popover show — hydrates the panel without waiting for the first tick.
+- Every 5 seconds while the popover remains visible.
+- No polling while the popover is closed.
+
+Rationale:
+
+- **Why 5s, not faster or slower.** The installer already runs a 5s `Supervisor.is_alive()` + `/ping` health-poll timer (the one that drives the red menu-bar state badge when the helper is unresponsive / in port conflict). Co-fetching `/status` on the same tick means no second timer, no extra wake-ups for the power-management subsystem to reason about — one consolidated 5s heartbeat that runs while the popover is visible. 5s sits comfortably under R7's 15s heartbeat / 60s TTL window: the panel observes fresh GUI pushes within ≤5s of arrival, and observes session-mode TTL expiry (the 404 transition) within ≤5s of it happening. A faster cadence (1–2s) would feel marginally more "live" but consume battery for sub-perceptual gains; a slower cadence (10s) would risk the panel showing stale data through a TTL-expiry transition for up to half the TTL window. 5s is the sweet spot.
+
+- **Why visibility-gated.** The panel renders only when the popover is visible. Polling while it's closed produces no observable effect — the user can't see what the panel would draw. On a battery-powered laptop with the popover closed for hours at a time, eliding the poll entirely keeps the launcher CPU-idle and lets macOS's app-nap and Windows's modern-standby paths do their thing without an HTTP-poll loop preventing deeper sleep states. NSPopover's `popoverWillShow:` / `popoverWillClose:` delegate methods on macOS are the start/stop signals; equivalent platform hooks will drive this on Windows / Linux when those installer ports land.
+
+- **Why not focus-gated instead.** A focused-popover-only variant (poll only when the user has the popover focused) was considered and rejected: a transient popover loses focus the moment the user moves attention elsewhere on screen, but stays *visible* until it's dismissed by click-outside. Halting polling on focus-loss would freeze the panel during the user's most likely look-at moments (popover open, user reading the values while their attention's already drifted to the next thing).
+
+Implementation note (informational, not contract): the installer's existing health poll timer lives in `bsky_saves_launcher.tray.TrayApp`; the status fetch will be added there. The popover's `popoverWillShow:` schedules an immediate fetch and `popoverWillClose:` clears the next-fetch timestamp. No change to the panel's existing auth flow — the same bearer token is reused.
