@@ -1,6 +1,6 @@
 # Installer status panel — cross-repo coordination doc
 
-> **Status:** drafting (2026-05-22). Installer revision: R11 fully closed end-to-end — `current_state === "refreshing"` First Fetch render branch shipped, and the progress-delta inference fallback retired (no `/ping` version gate; internal dogfooding only). Q11 (`"error"` semantics) and Q12 (overwrite vs merge on startup) still awaiting CLI acceptance of the GUI-proposed resolutions in §7. No payload-shape changes.
+> **Status:** drafting (2026-05-23). Installer revision: raises Q13 — during a cold-start First Fetch (fresh pairing, no prior helper snapshot) the GUI doesn't push any in-flight state until the fetch completes, so the panel's `current_state === "refreshing"` render branch (already shipped per R11) has nothing to render and the user sees no feedback during the initial fetch. Proposes a single GUI push at fetch start with `library.handle: null` + `current_state: "refreshing"`. No payload-shape change.
 > **Lives at:** `bsky-saves-coordination:docs/installer-status-panel.md` (canonical). Mirrored as a draft in each primary repo's `coordination` branch and PRed back via cross-repo workflow.
 > **Audience:** maintainers of `bsky-saves` (helper / CLI), `bsky-saves-gui` (Svelte PWA), and `bsky-saves-install` (native macOS app + future Win/Linux installers).
 > **Scope:** the contract for the installer's status panel — what info it surfaces, where the info comes from, who's responsible for each leg.
@@ -298,6 +298,30 @@ Q11 (semantics of `current_state === "error"`) resolved and moved to [R12](./ins
 
 Q12 (GUI-startup snapshot: overwrite vs merge) resolved and moved to [R13](./installer-status-panel-resolved.md#r13--gui-startup-snapshot-overwrite-vs-merge). Locked **overwrite** — post-#85 the GUI's startup push carries `last_activity` restored from `idb-keyval`, so overwrite preserves the user's last-known state rather than clobbering it with empty defaults. Contract codified as new [§4.8](#48-startup-flow-contract); helper-side wholesale-replacement invariant pinned by a test in `bsky-saves:tests/test_status.py`.
 
+**Q13 — Initial-fetch in-flight push: missing `"refreshing"` signal before any library data exists** *(raised by Installer 2026-05-23, observed in v0.4.0 RC testing against `bsky-saves==0.6.8rc2` + `bsky-saves-gui` v0.6.5-rc.4)*. R11's panel-side closure shipped the `current_state === "refreshing"` render branch on the installer side (handles the "GUI has reported a refresh but no library handle yet" case). However, during a true cold-start First Fetch — i.e. a fresh pairing where the helper has never persisted any status — the GUI never pushes anything to the helper while the fetch is running. The panel polls `GET /status`, receives `404 {"error": "no status snapshot"}` for the entire duration of the fetch, and `_render_library_section` sees `snap = None` → renders the static placeholder "No active library status yet.". When the fetch finishes, the GUI pushes the full populated snapshot in a single push and the panel jumps from "No active library status yet." straight to the fully-loaded library view — no in-flight feedback is ever shown.
+
+Contrast with subsequent refreshes: once a snapshot exists on the helper, manual-refresh paths correctly push `current_state="refreshing"` mid-flight and the panel renders "Refreshing…" inline. So the gap is specifically the **pre-first-snapshot** window.
+
+Symptom is identical to what R11 was originally framed to solve, just at a different layer: R11 fixed the panel render branch; Q13 asks whether the GUI can also push a minimal in-flight snapshot at the *start* of the initial fetch so that branch has something to render.
+
+Proposed resolution (panel-side perspective, awaiting GUI team's response):
+
+- **At the start** of `initialFetchSaves()` (or whatever the equivalent function is named in `bsky-saves-gui`'s library-refresh orchestrator), the pusher emits one synchronous push with:
+  - `current_state: "refreshing"`
+  - `library.did: <known-from-sign-in>` (required so the panel can identify the slot — even if no other library fields are known yet)
+  - `library.handle: null` (or absent) — keeps the panel in the placeholder branch, where the existing in-flight render path will display "Fetching library…"
+  - `last_activity`: whatever's currently in memory (idle sentinel if literally first-ever start)
+  - `priority`: default (not `"final"`; this isn't a synchronous-flush case)
+- No payload-shape change — `library.handle: null` is already documented as the "unidentified" state. Just an additional push trigger added to §4.3's list.
+
+Alternatives considered and rejected by the installer side:
+
+1. **Launcher polls `/ping` for GUI presence and synthesizes an in-flight state.** Rejected: cross-cuts the contract, makes the panel's source of truth split between `/status` and `/ping`, and papers over a real push-trigger gap.
+2. **Just show "Waiting for GUI to connect…" on 404.** Rejected: indistinguishable from the legitimate "no GUI ever connected" empty state; bad UX during the common first-fetch flow which IS the most common time a user opens the panel.
+3. **Add a `/status` long-poll endpoint.** Rejected: scope creep, contract widening.
+
+Status: proposed-by-Installer, awaiting GUI acceptance. No payload-shape change.
+
 ## 8. Maintenance
 
 This document is the cross-repo contract. Any of the following changes should be accompanied by a PR updating this doc:
@@ -328,6 +352,7 @@ When the design changes substantively (e.g., adopting phase 2's command flow), b
 | 2026-05-22 | GUI | Q10 fix shipped: tenorune/bsky-saves-gui#85 merged to main, released in v0.6.5-rc.4. Moved Q10 from §7 to appendix as R11 with implementation status (mid-hydration + post-restart symptoms verified resolved against rc.4; First Fetch blank-panel symptom awaits the installer's `current_state === "refreshing"` render branch). Corrected the §4.4 `current_state` field note's pre-fix version reference (≤ v0.6.5-rc.3, not ≤ rc.4 — rc.4 is the first build with the fix). Answered Q11 with GUI-proposed resolution: emission scoped to library-refresh-level failures only (per-asset hydration failures stay in `last_activity.errors[]`); snapshot-bound stickiness with helper persisting `"error"` like any other state; rendering/retry deferred to panel team; called out the GUI-tab-reload caveat (current GUI doesn't re-emit `"error"` after reload, so a snapshot can be silently overwritten with `"idle"` — known limitation, candidate for a future improvement). Answered Q12 with GUI-proposed resolution: keep overwrite (status quo, post-#85). Proposed contract text for the startup-flow contract; suggested placement in §4.4 or a new §4.8. Q11 and Q12 both status: proposed-by-GUI, awaiting CLI acceptance. No payload-shape changes in this revision. |
 | 2026-05-22 | Installer | Closed R11 end-to-end. Shipped the `current_state === "refreshing"` render branch on `claude/spec-installer-status-panel` (`bsky-saves-install`): placeholder headline reads "Fetching library…" pre-handle, last-activity row reads "Refreshing…" / "Backing up…" inline once a library is identified (commit `73e035e`). Retired the progress-delta inference fallback (`status.hydration_is_progressing`, `StatusPopover._hydration_active_until`, the delta-detection branch in `update_library`, and associated tests) — panel now reads `snap.current_state` directly (commit `ec32356`). No `/ping`-based `gui_bundled` gate added: no external installer user base, internal dogfooding only. Updated R11 verification + §4.4 `current_state` field note + §3 status header to reflect closure. No payload, endpoint, auth, or schema changes. |
 | 2026-05-22 | CLI | Accepted GUI's Q11 and Q12 resolutions; moved Q11 → [R12](./installer-status-panel-resolved.md#r12--semantics-of-current_state--error) and Q12 → [R13](./installer-status-panel-resolved.md#r13--gui-startup-snapshot-overwrite-vs-merge). Added §4.8 (Startup-flow contract) with the GUI's proposed contract text describing the helper's wholesale-replacement obligation on GUI activation pushes. Cross-referenced the helper-side invariant test landing on `bsky-saves:tests/test_status.py` (separate commit on `tenorune/bsky-saves@main`). No payload-shape changes; §4.4 unchanged in this revision. |
+| 2026-05-23 | Installer | Raised Q13: cold-start First Fetch in-flight push gap. Observed in v0.4.0 RC testing on a fresh pairing — the helper has no persisted snapshot, the GUI doesn't push any in-flight state during the initial fetch, and the panel polls `GET /status` to a 404 (`{"error": "no status snapshot"}`) throughout the entire fetch duration. R11's panel-side render branch is in place and verified working on manual-refresh flows, but it has nothing to render in the cold-start window because the GUI hasn't pushed any `current_state` yet. Proposes a single push at the start of the initial fetch with `library.handle: null` + `current_state: "refreshing"` so the existing panel branch can render "Fetching library…" during the cold-start window. No payload-shape change; just an added push trigger in §4.3. Awaiting GUI team review. Updated §3 status header. |
 
 ---
 
